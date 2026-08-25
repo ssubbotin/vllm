@@ -986,6 +986,22 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             )
             self.use_trtllm_decode_attention = False
             self.flashinfer_trtllm_api_decode_kernel = None
+        if (
+            self.use_fa2_nvfp4_kv
+            and self.flashinfer_trtllm_api_decode_kernel is not None
+        ):
+            # NVFP4 KV on sm12x decodes through the FI-native FA2 paged
+            # reader; the dedicated XQA forward path rejects nvfp4 (its
+            # branch asserts not is_kvcache_nvfp4), so selecting XQA here
+            # kills startup during cudagraph capture. At equal cudagraph
+            # mode XQA also measured 0.7-1.2% slower than fa2 decode
+            # (#49818), so nothing is lost by never selecting it.
+            logger.info_once(
+                "NVFP4 KV on sm12x: decode via native FlashInfer FA2; "
+                "the dedicated XQA path is not selected for nvfp4."
+            )
+            self.use_trtllm_decode_attention = False
+            self.flashinfer_trtllm_api_decode_kernel = None
         self.use_dedicated_xqa = (
             current_platform.is_device_capability_family(120)
             and self.flashinfer_trtllm_api_decode_kernel == FlashInferDecodeKernel.XQA
@@ -1200,6 +1216,16 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         is_sm12x = current_platform.is_device_capability_family(120)
         # XQA does not return LSE and therefore does not support DCP.
         if is_sm12x and vllm_config.parallel_config.decode_context_parallel_size > 1:
+            return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+
+        # NVFP4 KV on sm12x decodes via the FI-native FA2 path (the
+        # dedicated XQA kernel is never selected for nvfp4 in __init__),
+        # so only single-token uniform decode batches are graph-capturable.
+        if (
+            is_sm12x
+            and vllm_config.cache_config is not None
+            and vllm_config.cache_config.cache_dtype.startswith("nvfp4")
+        ):
             return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
 
         kv_specs = iter_layer_specs(kv_cache_spec)
