@@ -971,3 +971,101 @@ def test_qsa_streaming_compression_and_compressor_state_store_match_reference() 
                 rope_cache[block, position % 4, 0],
                 position_row(request, position).to("cuda"),
             )
+
+
+def test_qsa_backend_declares_fp8_kv_cache_support() -> None:
+    from vllm.models.qwen4_exp.nvidia.qsa import Qwen4ExpQSAFlashAttentionBackend
+
+    backend = Qwen4ExpQSAFlashAttentionBackend
+    assert backend.supports_kv_cache_dtype("bfloat16")
+    assert backend.supports_kv_cache_dtype("fp8")
+    assert backend.supports_kv_cache_dtype("fp8_e4m3")
+    assert backend.supports_kv_cache_dtype("fp8_e5m2")
+    # Quantization modes the QSA kernel cannot decode stay refused.
+    assert not backend.supports_kv_cache_dtype("nvfp4")
+    assert not backend.supports_kv_cache_dtype("int8_per_token_head")
+
+
+@requires_qsa_kernels
+@pytest.mark.skipif(
+    not current_platform.supports_fp8(),
+    reason="FP8 QSA KV cache requires an FP8-capable GPU",
+)
+@pytest.mark.parametrize("fp8_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+def test_qsa_sparse_paged_attention_dequantizes_fp8_kv_cache(
+    fp8_dtype: torch.dtype,
+) -> None:
+    torch.manual_seed(3)
+    num_rows, num_query_heads, num_kv_heads = 16, 12, 1
+    head_dim, page_size = 256, 128
+    num_requests, num_pages_per_request = 2, 4
+    num_cache_blocks = num_requests * num_pages_per_request
+    context_length = num_pages_per_request * page_size
+    topk = 64
+
+    q = torch.randn(
+        num_rows, num_query_heads, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    kv_cache = torch.randn(
+        num_cache_blocks,
+        page_size,
+        num_kv_heads,
+        2 * head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    k_cache, v_cache = kv_cache.split(head_dim, dim=-1)
+
+    # Distinct scales: dropping either one, or applying one in place of the
+    # other, moves the result far outside the tolerance below.
+    k_scale = torch.tensor(0.25, dtype=torch.float32, device="cuda")
+    v_scale = torch.tensor(0.5, dtype=torch.float32, device="cuda")
+    quantized = torch.cat(
+        [
+            (k_cache.float() / k_scale).to(fp8_dtype),
+            (v_cache.float() / v_scale).to(fp8_dtype),
+        ],
+        dim=-1,
+    )
+    # Split views so the kernel sees the strided caches forward_qsa hands it.
+    k_quantized, v_quantized = quantized.split(head_dim, dim=-1)
+    # Compare against exactly what the kernel is expected to reconstruct, so
+    # the assertion measures dequantization and not rounding to FP8.
+    k_dequantized = (k_quantized.float() * k_scale).to(torch.bfloat16)
+    v_dequantized = (v_quantized.float() * v_scale).to(torch.bfloat16)
+
+    block_table = (
+        torch.randperm(num_cache_blocks, device="cuda")
+        .reshape(num_requests, num_pages_per_request)
+        .to(torch.int32)
+    )
+    token_to_req = (
+        torch.arange(num_rows, device="cuda") // (num_rows // num_requests)
+    ).to(torch.int32)
+    logical_indices = torch.randint(
+        0, context_length, (num_rows, topk), device="cuda", dtype=torch.int32
+    )
+    # Padded selections must stay inert under quantization too.
+    logical_indices[-1, -8:] = -1
+
+    actual = qsa_ops.qsa_sparse_paged_attention(
+        q,
+        k_quantized,
+        v_quantized,
+        logical_indices,
+        block_table,
+        token_to_req,
+        k_scale=k_scale,
+        v_scale=v_scale,
+    )
+    expected = _qsa_sparse_paged_attention_reference(
+        q,
+        k_dequantized,
+        v_dequantized,
+        logical_indices,
+        block_table,
+        token_to_req,
+        head_dim**-0.5,
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)

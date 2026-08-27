@@ -14,6 +14,13 @@ from vllm.triton_utils import HAS_TRITON, tl, triton
 _LOGITS_WORKSPACE_BYTES = 128 * 1024 * 1024
 _TOPK_WORKSPACE_BYTES = 1024 * 1024
 
+_FP8_DTYPES = (
+    torch.float8_e4m3fn,
+    torch.float8_e4m3fnuz,
+    torch.float8_e5m2,
+    torch.float8_e5m2fnuz,
+)
+
 
 @triton.jit
 def _qsa_mqa_paged_kernel(
@@ -197,6 +204,8 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     indices_ptr,
     block_table_ptr,
     token_to_req_ptr,
+    k_scale_ptr,
+    v_scale_ptr,
     partial_output_ptr,
     partial_lse_ptr,
     output_ptr,
@@ -225,6 +234,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     NUM_TILES: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    USE_FP8: tl.constexpr,
 ) -> None:
     row = tl.program_id(0)
     kv_head = tl.program_id(1)
@@ -297,9 +307,18 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
             mask=valid[:, None],
             other=0.0,
         )
+        if USE_FP8:
+            # Dequantize into the query dtype. The per-tensor key scale
+            # rides the softmax multiply below rather than touching
+            # every loaded element.
+            keys = keys.to(query.dtype)
+            values = values.to(query.dtype)
         scores = tl.dot(query, keys)
         # Scaling scores avoids re-quantizing a scaled query to BF16.
-        scores *= softmax_scale_log2
+        if USE_FP8:
+            scores *= softmax_scale_log2 * tl.load(k_scale_ptr)
+        else:
+            scores *= softmax_scale_log2
         scores = tl.where(valid[None, :], scores, -1.0e20)
         next_max = tl.maximum(max_value, tl.max(scores, axis=1))
         alpha = tl.math.exp2(max_value - next_max)
@@ -320,6 +339,11 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
         accumulator / tl.maximum(normalizer[:, None], 1.0e-20),
         0.0,
     )
+    if USE_FP8:
+        # A per-tensor value scale commutes through the softmax
+        # normalization and through the split-k merge, so one multiply
+        # here is exact for both.
+        normalized_output = normalized_output * tl.load(v_scale_ptr)
     output_mask = head_offsets[:, None] < GROUP_SIZE
     if NUM_SPLITS == 1:
         tl.store(
@@ -817,8 +841,10 @@ def qsa_sparse_paged_attention(
     block_table: torch.Tensor,
     token_to_req: torch.Tensor,
     out: torch.Tensor | None = None,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Run sparse GQA directly over paged BF16 K/V caches."""
+    """Run sparse GQA directly over paged BF16 or FP8 K/V caches."""
 
     if not q.is_cuda or not HAS_TRITON:
         raise RuntimeError("paged QSA sparse attention requires CUDA and Triton")
@@ -836,7 +862,14 @@ def qsa_sparse_paged_attention(
         raise ValueError("QSA sparse attention requires valid grouped-query heads")
     head_dim = q.shape[2]
     assert head_dim >= 16 and (head_dim & (head_dim - 1)) == 0
-    assert q.dtype == k_cache.dtype == v_cache.dtype == torch.bfloat16
+    use_fp8 = k_cache.dtype in _FP8_DTYPES
+    if use_fp8:
+        if k_scale is None or v_scale is None:
+            raise ValueError("FP8 QSA K/V caches require both k_scale and v_scale")
+        assert k_cache.dtype == v_cache.dtype
+    else:
+        assert k_cache.dtype == v_cache.dtype == torch.bfloat16
+    assert q.dtype == torch.bfloat16
     assert logical_indices.dtype == block_table.dtype == torch.int32
     assert token_to_req.dtype == torch.int32
     assert q.device == k_cache.device == v_cache.device
@@ -901,6 +934,8 @@ def qsa_sparse_paged_attention(
         logical_indices,
         block_table,
         token_to_req,
+        k_scale if use_fp8 else q,
+        v_scale if use_fp8 else q,
         partial_output,
         partial_lse,
         out,
@@ -929,6 +964,7 @@ def qsa_sparse_paged_attention(
         NUM_TILES=num_tiles,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
+        USE_FP8=use_fp8,
         num_warps=partial_warps,
         num_stages=2,
     )
